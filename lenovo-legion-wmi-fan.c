@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 /*
  * lenovo-legion-wmi-fan.c - Fan curve control for Lenovo Legion Go series
  *
@@ -676,5 +676,5 @@ module_exit(legion_wmi_fan_exit);
 
 MODULE_AUTHOR("honjow");
 MODULE_DESCRIPTION("Lenovo Legion Go WMI fan curve driver");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_VERSION("0.1.0");
