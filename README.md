@@ -30,15 +30,37 @@ This driver fills that gap without touching or conflicting with any mainline cod
 
 ## How it coexists with mainline drivers
 
-The WMI framework supports `.no_singleton = true`, which allows multiple drivers
-to bind to the same GUID simultaneously.  This driver sets that flag, so it runs
-side-by-side with `lenovo_wmi_gamezone` without any conflict.  Each driver calls
-completely different method IDs and neither interferes with the other.
+This driver is implemented as a **platform driver** that calls the WMI firmware
+methods directly via `wmi_evaluate_method()` (the global GUID-based API).  It
+does **not** bind to the WMI device instance, which means it coexists safely
+with `lenovo_wmi_gamezone` even though both reference the same GameZone GUID.
+
+On Legion Go hardware, the GameZone GUID has a single device instance that
+`lenovo_wmi_gamezone` binds to for `platform_profile` support.  A second
+`wmi_driver` would never get probed because there is no second instance.
+Using the GUID-based call API sidesteps that limitation entirely.
+
+Each driver uses completely different method IDs and neither interferes with
+the other.
+
+## Firmware protocol notes
+
+The Legion Go firmware uses a different protocol from older Lenovo devices:
+
+- **Fan curve read** (WMAB method 0x05): returns 44 bytes —
+  `count(u32 LE) + 10 × speed(u32 LE)`.  No fan_id/sensor_id header.
+- **Fan curve write** (WMAB method 0x06): takes 52 bytes with a fixed
+  temperature table (10, 20, …, 100 °C) embedded in the buffer.
+- **Temperature set-points are fixed** at 10, 20, 30, 40, 50, 60, 70, 80,
+  90, 100 °C by the firmware and cannot be changed.
+- **Fan RPM cannot be read** — `GetFanCount` (0x23), `GetCurrentFanSpeed`
+  (0x10), and `GetFanMaxSpeed` (0x24) all return 0 on this hardware.
+- **Full-speed toggle** uses `\_SB.GZFD.WMAE` method 0x12 (a separate ACPI
+  method from WMAB), with feature_id `0x04020000`.
 
 ## Prerequisites
 
-- Linux kernel **6.14** or later (required for `no_singleton` WMI support and the
-  modern `hwmon` API used here)
+- Linux kernel **6.8** or later (required for the modern `hwmon` API used here)
 - `dkms` package
 - `linux-headers` matching your running kernel
 
@@ -82,7 +104,7 @@ sudo make uninstall      # manual
 
 After loading the module, a new hwmon device appears (e.g. `/sys/class/hwmon/hwmonN`
 where `name` reads `legion_wmi_fan`).  A `fan_fullspeed` attribute is also
-created directly under the WMI device in `/sys/bus/wmi/devices/`.
+created directly under the platform device in `/sys/bus/platform/devices/legion-wmi-fan/`.
 
 ### Identify the hwmon device
 
@@ -91,15 +113,6 @@ for h in /sys/class/hwmon/hwmon*; do
     echo "$h: $(cat $h/name)";
 done
 ```
-
-### Reading the current fan speed
-
-```bash
-cat /sys/class/hwmon/hwmonN/fan1_input
-```
-
-The raw value returned by the firmware is a percentage (0–100); it is exposed
-as-is.
 
 ### Reading the current fan curve
 
@@ -111,21 +124,22 @@ for i in $(seq 1 10); do
 done
 ```
 
+Temperature set-points are fixed by the firmware at 10, 20, …, 100 °C and
+are exposed **read-only** (`pwm1_auto_point*_temp`).
+
 ### Setting a custom fan curve
 
-First put the fan in manual mode, then write the desired curve:
+First put the fan in manual mode, then write the desired PWM values:
 
 ```bash
 # Enable manual (custom curve) mode
 echo 1 | sudo tee /sys/class/hwmon/hwmonN/pwm1_enable
 
-# Temperatures in millidegrees Celsius, PWM values 0-255
-sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point1_temp  <<< 30000   # 30°C
-sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point1_pwm   <<< 0
-sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point2_temp  <<< 40000   # 40°C
-sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point2_pwm   <<< 51      # ~20%
-sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point3_temp  <<< 50000
-sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point3_pwm   <<< 102     # ~40%
+# PWM values 0-255 (temperatures are fixed by firmware, no need to set them)
+sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point1_pwm   <<< 0      # 10°C → 0%
+sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point2_pwm   <<< 0      # 20°C → 0%
+sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point3_pwm   <<< 51     # 30°C → ~20%
+sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point4_pwm   <<< 102    # 40°C → ~40%
 # … and so on up to point 10
 ```
 
@@ -141,15 +155,9 @@ echo 2 | sudo tee /sys/class/hwmon/hwmonN/pwm1_enable
 # Via pwm1_enable
 echo 0 | sudo tee /sys/class/hwmon/hwmonN/pwm1_enable
 
-# Or via the dedicated sysfs attribute
-echo 1 | sudo tee /sys/bus/wmi/devices/887B54E3-DDDC-4B2C-8B88-68A26A8835D0-*/fan_fullspeed
+# Or via the dedicated sysfs attribute on the platform device
+echo 1 | sudo tee /sys/bus/platform/devices/legion-wmi-fan/fan_fullspeed
 ```
-
-### Using with `fancontrol` (lm-sensors)
-
-`fancontrol` can read the hwmon attributes directly.  Run `pwmconfig` to
-generate a `/etc/fancontrol` configuration file that references the
-`legion_wmi_fan` hwmon device.
 
 ## `pwm1_enable` values
 
@@ -168,8 +176,9 @@ Check `dmesg | grep legion_wmi`:
 - `"Not a supported Legion Go device"` — your device's DMI product version
   string is not in the match table.  Open an issue with the output of
   `sudo dmidecode -s system-product-version`.
-- `"GetFanCount failed"` — the firmware method IDs don't match your BIOS
-  version.  Capture `sudo acpidump > acpidump.txt` and open an issue.
+- `"Failed to read fan curve from firmware"` — the firmware method IDs don't
+  match your BIOS version.  Capture `sudo acpidump > acpidump.txt` and open
+  an issue.
 
 **Kernel version too old**
 
