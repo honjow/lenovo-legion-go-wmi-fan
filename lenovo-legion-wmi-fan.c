@@ -2,19 +2,23 @@
 /*
  * lenovo-legion-wmi-fan.c - Fan curve control for Lenovo Legion Go series
  *
- * Binds to the GameZone WMI GUID (887B54E3-DDDC-4B2C-8B88-68A26A8835D0)
- * using .no_singleton = true so it coexists with the mainline
- * lenovo_wmi_gamezone driver.  That driver only uses method IDs 43/44/45;
- * this driver uses IDs 5/6/16/18/35/36 — a completely disjoint set.
+ * Uses the GameZone WMI GUID (887B54E3-DDDC-4B2C-8B88-68A26A8835D0) via the
+ * global wmi_evaluate_method() API.  This avoids binding to the WMI device
+ * instance (which is already bound to lenovo_wmi_gamezone) and registers as
+ * a platform driver instead.
+ *
+ * The mainline lenovo_wmi_gamezone driver uses method IDs 43/44/45 for
+ * platform_profile switching.  This driver uses IDs 5/6/16/18/35/36 — a
+ * completely disjoint set — so there is no conflict.
  *
  * Exposes:
  *   hwmon  – fan1_input, pwm1_enable, pwm1_auto_point{1-10}_{pwm,temp}
  *   sysfs  – fan_fullspeed
  *
- * Minimum kernel version: 6.14 (no_singleton + modern hwmon API)
- *
  * Copyright (C) 2026 honjow
  */
+
+#define pr_fmt(fmt) "legion_wmi_fan: " fmt
 
 #include <linux/acpi.h>
 #include <linux/dmi.h>
@@ -22,6 +26,7 @@
 #include <linux/hwmon-sysfs.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/platform_device.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include <linux/wmi.h>
@@ -66,7 +71,6 @@ struct legion_fan_curve {
 };
 
 struct legion_wmi_fan {
-	struct wmi_device	*wdev;
 	struct device		*hwmon_dev;
 	struct mutex		 lock;		/* protects curve + pwm_enable */
 	struct legion_fan_curve	 curve;
@@ -74,12 +78,11 @@ struct legion_wmi_fan {
 };
 
 /* -------------------------------------------------------------------------
- * Standalone WMI evaluate helpers (no lenovo_wmi_helpers dependency)
+ * Standalone WMI evaluate helpers (uses global GUID-based API)
  * ------------------------------------------------------------------------- */
 
 /**
  * legion_wmi_evaluate() - call a WMI method and optionally return the object
- * @wdev:	WMI device
  * @method_id:	method identifier passed to the firmware
  * @in_buf:	pointer to input buffer (may be NULL if in_len == 0)
  * @in_len:	length of input buffer in bytes
@@ -88,7 +91,7 @@ struct legion_wmi_fan {
  *
  * Returns 0 on success, negative errno on failure.
  */
-static int legion_wmi_evaluate(struct wmi_device *wdev, u8 method_id,
+static int legion_wmi_evaluate(u8 method_id,
 			       const void *in_buf, size_t in_len,
 			       union acpi_object **out)
 {
@@ -96,7 +99,8 @@ static int legion_wmi_evaluate(struct wmi_device *wdev, u8 method_id,
 	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
 	acpi_status status;
 
-	status = wmidev_evaluate_method(wdev, 0, method_id, &input, &result);
+	status = wmi_evaluate_method(LENOVO_GAMEZONE_GUID, 0, method_id,
+				     &input, &result);
 	if (ACPI_FAILURE(status))
 		return -EIO;
 
@@ -114,14 +118,14 @@ static int legion_wmi_evaluate(struct wmi_device *wdev, u8 method_id,
  * Handles both ACPI_TYPE_INTEGER and short ACPI_TYPE_BUFFER responses
  * (some firmware versions return a 4-byte buffer instead of an integer).
  */
-static int legion_wmi_evaluate_int(struct wmi_device *wdev, u8 method_id,
+static int legion_wmi_evaluate_int(u8 method_id,
 				   const void *in_buf, size_t in_len,
 				   u64 *out_val)
 {
 	union acpi_object *obj = NULL;
 	int ret;
 
-	ret = legion_wmi_evaluate(wdev, method_id, in_buf, in_len, &obj);
+	ret = legion_wmi_evaluate(method_id, in_buf, in_len, &obj);
 	if (ret)
 		return ret;
 	if (!obj)
@@ -156,7 +160,7 @@ static int legion_get_fan_curve(struct legion_wmi_fan *lf)
 	u8 *buf;
 	int ret, i;
 
-	ret = legion_wmi_evaluate(lf->wdev, FAN_METHOD_GET_CURVE,
+	ret = legion_wmi_evaluate(FAN_METHOD_GET_CURVE,
 				  in, sizeof(in), &obj);
 	if (ret)
 		return ret;
@@ -246,7 +250,7 @@ static int legion_set_fan_curve(struct legion_wmi_fan *lf)
 		p += sizeof(u16);
 	}
 
-	return legion_wmi_evaluate(lf->wdev, FAN_METHOD_SET_CURVE,
+	return legion_wmi_evaluate(FAN_METHOD_SET_CURVE,
 				   buf, sizeof(buf), NULL);
 }
 
@@ -268,7 +272,7 @@ static int legion_set_fullspeed(struct legion_wmi_fan *lf, bool enable)
 	buf[3] = enable ? 0x01 : 0x00;
 	buf[4] = 0x00;
 
-	return legion_wmi_evaluate(lf->wdev, FAN_METHOD_SET_FEATURE,
+	return legion_wmi_evaluate(FAN_METHOD_SET_FEATURE,
 				   buf, sizeof(buf), NULL);
 }
 
@@ -308,7 +312,7 @@ static int legion_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 		if (attr != hwmon_fan_input)
 			return -EOPNOTSUPP;
 		mutex_lock(&lf->lock);
-		ret = legion_wmi_evaluate_int(lf->wdev, FAN_METHOD_GET_SPEED,
+		ret = legion_wmi_evaluate_int(FAN_METHOD_GET_SPEED,
 					      in, sizeof(in), &speed);
 		mutex_unlock(&lf->lock);
 		if (ret)
@@ -612,43 +616,37 @@ static const struct dmi_system_id legion_go_dmi_table[] = {
 };
 
 /* -------------------------------------------------------------------------
- * WMI driver probe / remove
+ * Platform driver probe / remove
  * ------------------------------------------------------------------------- */
 
-static int legion_wmi_fan_probe(struct wmi_device *wdev, const void *ctx)
+static int legion_wmi_fan_probe(struct platform_device *pdev)
 {
-	struct device *dev = &wdev->dev;
+	struct device *dev = &pdev->dev;
 	struct legion_wmi_fan *lf;
 	u8 in[4] = { 0 };
 	u64 fan_count = 0;
 	int ret;
 
-	if (!dmi_check_system(legion_go_dmi_table)) {
-		dev_dbg(dev, "Not a supported Legion Go device, skipping\n");
-		return -ENODEV;
-	}
-
 	lf = devm_kzalloc(dev, sizeof(*lf), GFP_KERNEL);
 	if (!lf)
 		return -ENOMEM;
 
-	lf->wdev       = wdev;
 	lf->pwm_enable = PWM_ENABLE_AUTO;
 	mutex_init(&lf->lock);
 	dev_set_drvdata(dev, lf);
 
 	/* Verify the firmware supports fan control */
-	ret = legion_wmi_evaluate_int(wdev, FAN_METHOD_GET_COUNT,
+	ret = legion_wmi_evaluate_int(FAN_METHOD_GET_COUNT,
 				      in, sizeof(in), &fan_count);
 	if (ret) {
-		dev_err(dev, "GetFanCount failed (%d)\n", ret);
+		dev_warn(dev, "Failed to get fan count (%d)\n", ret);
 		return ret;
 	}
 	if (fan_count == 0) {
-		dev_err(dev, "Firmware reports zero fans\n");
+		dev_warn(dev, "Firmware reports zero fans\n");
 		return -ENODEV;
 	}
-	dev_dbg(dev, "Fan count: %llu\n", fan_count);
+	dev_info(dev, "Fan count: %llu\n", fan_count);
 
 	/* Snapshot the current fan curve from firmware */
 	ret = legion_get_fan_curve(lf);
@@ -662,14 +660,14 @@ static int legion_wmi_fan_probe(struct wmi_device *wdev, const void *ctx)
 		&legion_hwmon_chip, legion_hwmon_extra_groups);
 	if (IS_ERR(lf->hwmon_dev)) {
 		ret = PTR_ERR(lf->hwmon_dev);
-		dev_err(dev, "hwmon registration failed (%d)\n", ret);
+		dev_warn(dev, "hwmon registration failed (%d)\n", ret);
 		return ret;
 	}
 
-	/* fan_fullspeed sysfs attribute on the WMI device itself */
+	/* fan_fullspeed sysfs attribute on the platform device itself */
 	ret = devm_device_add_group(dev, &legion_wmi_fan_group);
 	if (ret) {
-		dev_err(dev, "sysfs group creation failed (%d)\n", ret);
+		dev_warn(dev, "sysfs group creation failed (%d)\n", ret);
 		return ret;
 	}
 
@@ -678,32 +676,65 @@ static int legion_wmi_fan_probe(struct wmi_device *wdev, const void *ctx)
 	return 0;
 }
 
-static void legion_wmi_fan_remove(struct wmi_device *wdev)
+static void legion_wmi_fan_remove(struct platform_device *pdev)
 {
-	dev_dbg(&wdev->dev, "Lenovo Legion Go WMI fan driver unloaded\n");
+	dev_info(&pdev->dev, "Lenovo Legion Go WMI fan driver unloaded\n");
 }
 
 /* -------------------------------------------------------------------------
  * Module infrastructure
  * ------------------------------------------------------------------------- */
 
-static const struct wmi_device_id legion_wmi_fan_id_table[] = {
-	{ LENOVO_GAMEZONE_GUID, NULL },
-	{ }
-};
-MODULE_DEVICE_TABLE(wmi, legion_wmi_fan_id_table);
-
-static struct wmi_driver legion_wmi_fan_driver = {
+static struct platform_driver legion_wmi_fan_driver = {
 	.driver = {
-		.name = "lenovo_wmi_fan",
+		.name = "legion-wmi-fan",
 	},
-	.id_table     = legion_wmi_fan_id_table,
-	.probe        = legion_wmi_fan_probe,
-	.remove       = legion_wmi_fan_remove,
-	.no_singleton = true,
+	.probe  = legion_wmi_fan_probe,
+	.remove = legion_wmi_fan_remove,
 };
 
-module_wmi_driver(legion_wmi_fan_driver);
+static struct platform_device *legion_wmi_fan_pdev;
+
+static int __init legion_wmi_fan_init(void)
+{
+	int ret;
+
+	if (!dmi_check_system(legion_go_dmi_table)) {
+		pr_info("not a supported Legion Go device\n");
+		return -ENODEV;
+	}
+
+	if (!wmi_has_guid(LENOVO_GAMEZONE_GUID)) {
+		pr_info("GameZone WMI GUID not found\n");
+		return -ENODEV;
+	}
+
+	legion_wmi_fan_pdev = platform_device_register_simple(
+		"legion-wmi-fan", PLATFORM_DEVID_NONE, NULL, 0);
+	if (IS_ERR(legion_wmi_fan_pdev)) {
+		ret = PTR_ERR(legion_wmi_fan_pdev);
+		pr_warn("platform device creation failed (%d)\n", ret);
+		return ret;
+	}
+
+	ret = platform_driver_register(&legion_wmi_fan_driver);
+	if (ret) {
+		pr_warn("platform driver registration failed (%d)\n", ret);
+		platform_device_unregister(legion_wmi_fan_pdev);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void __exit legion_wmi_fan_exit(void)
+{
+	platform_driver_unregister(&legion_wmi_fan_driver);
+	platform_device_unregister(legion_wmi_fan_pdev);
+}
+
+module_init(legion_wmi_fan_init);
+module_exit(legion_wmi_fan_exit);
 
 MODULE_AUTHOR("honjow");
 MODULE_DESCRIPTION("Lenovo Legion Go WMI fan curve driver");

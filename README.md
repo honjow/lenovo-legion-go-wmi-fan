@@ -30,15 +30,22 @@ This driver fills that gap without touching or conflicting with any mainline cod
 
 ## How it coexists with mainline drivers
 
-The WMI framework supports `.no_singleton = true`, which allows multiple drivers
-to bind to the same GUID simultaneously.  This driver sets that flag, so it runs
-side-by-side with `lenovo_wmi_gamezone` without any conflict.  Each driver calls
-completely different method IDs and neither interferes with the other.
+This driver is implemented as a **platform driver** that calls the WMI firmware
+methods directly via `wmi_evaluate_method()` (the global GUID-based API).  It
+does **not** bind to the WMI device instance, which means it coexists safely
+with `lenovo_wmi_gamezone` even though both reference the same GameZone GUID.
+
+On Legion Go hardware, the GameZone GUID has a single device instance that
+`lenovo_wmi_gamezone` binds to for `platform_profile` support.  A second
+`wmi_driver` would never get probed because there is no second instance.
+Using the GUID-based call API sidesteps that limitation entirely.
+
+Each driver uses completely different method IDs and neither interferes with
+the other.
 
 ## Prerequisites
 
-- Linux kernel **6.14** or later (required for `no_singleton` WMI support and the
-  modern `hwmon` API used here)
+- Linux kernel **6.8** or later (required for the modern `hwmon` API used here)
 - `dkms` package
 - `linux-headers` matching your running kernel
 
@@ -141,8 +148,8 @@ echo 2 | sudo tee /sys/class/hwmon/hwmonN/pwm1_enable
 # Via pwm1_enable
 echo 0 | sudo tee /sys/class/hwmon/hwmonN/pwm1_enable
 
-# Or via the dedicated sysfs attribute
-echo 1 | sudo tee /sys/bus/wmi/devices/887B54E3-DDDC-4B2C-8B88-68A26A8835D0-*/fan_fullspeed
+# Or via the dedicated sysfs attribute on the platform device
+echo 1 | sudo tee /sys/bus/platform/devices/legion-wmi-fan/fan_fullspeed
 ```
 
 ### Using with `fancontrol` (lm-sensors)
