@@ -2,10 +2,11 @@
 /*
  * lenovo-legion-wmi-fan.c - Fan curve control for Lenovo Legion Go series
  *
- * Uses the GameZone WMI GUID (887B54E3-DDDC-4B2C-8B88-68A26A8835D0) via the
- * global wmi_evaluate_method() API.  This avoids binding to the WMI device
- * instance (which is already bound to lenovo_wmi_gamezone) and registers as
- * a platform driver instead.
+ * Uses the GameZone WMI GUID (887B54E3-DDDC-4B2C-8B88-68A26A8835D0) for
+ * detecting hardware support via wmi_has_guid().  Fan curve WMAB methods
+ * (0x05/0x06) are called directly via acpi_evaluate_object() on the ACPI
+ * path \_SB.GZFD.WMAB, because wmi_evaluate_method() wraps the firmware's
+ * buffer response as ACPI_TYPE_INTEGER, losing the actual buffer data.
  *
  * The mainline lenovo_wmi_gamezone driver uses method IDs 43/44/45 for
  * platform_profile switching.  This driver uses WMAB method IDs 5/6 and
@@ -48,7 +49,8 @@
 #define FAN_METHOD_GET_CURVE		0x05	/* GetFanTableData  */
 #define FAN_METHOD_SET_CURVE		0x06	/* SetFanTableData  */
 
-/* WMAE ACPI path and method for full-speed feature toggle */
+/* ACPI paths for WMAB (fan curve) and WMAE (full-speed feature) */
+#define WMAB_ACPI_PATH		"\\_SB.GZFD.WMAB"
 #define WMAE_ACPI_PATH		"\\_SB.GZFD.WMAE"
 #define WMAE_METHOD_SET_FEATURE	0x12
 #define FULLSPEED_FEATURE_ID	0x04020000U	/* SetFeatureStatus id */
@@ -81,36 +83,57 @@ struct legion_wmi_fan {
 };
 
 /* -------------------------------------------------------------------------
- * Standalone WMI evaluate helpers (uses global GUID-based API)
+ * WMAB ACPI evaluate helper (direct acpi_evaluate_object path)
+ *
+ * wmi_evaluate_method() wraps the firmware's buffer response as
+ * ACPI_TYPE_INTEGER for WMAB, losing the actual buffer data.  Calling
+ * \_SB.GZFD.WMAB directly via acpi_evaluate_object() returns the correct
+ * ACPI_TYPE_BUFFER response.
  * ------------------------------------------------------------------------- */
 
 /**
- * legion_wmi_evaluate() - call a WMI method and optionally return the object
- * @method_id:	method identifier passed to the firmware
- * @in_buf:	pointer to input buffer (may be NULL if in_len == 0)
+ * legion_wmab_evaluate() - call WMAB directly via acpi_evaluate_object()
+ * @method_id:	method identifier passed as the second integer argument
+ * @in_buf:	pointer to input buffer
  * @in_len:	length of input buffer in bytes
  * @out:	if non-NULL, receives the allocated acpi_object (caller frees);
- *		if NULL the result is freed here
+ *		if NULL the result is discarded
  *
  * Returns 0 on success, negative errno on failure.
  */
-static int legion_wmi_evaluate(u8 method_id,
-			       const void *in_buf, size_t in_len,
-			       union acpi_object **out)
+static int legion_wmab_evaluate(u8 method_id,
+				const void *in_buf, size_t in_len,
+				union acpi_object **out)
 {
-	struct acpi_buffer input  = { (acpi_size)in_len, (void *)in_buf };
+	struct acpi_object_list input;
+	union acpi_object params[3];
 	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	acpi_handle handle;
 	acpi_status status;
 
-	status = wmi_evaluate_method(LENOVO_GAMEZONE_GUID, 0, method_id,
-				     &input, &result);
+	status = acpi_get_handle(NULL, WMAB_ACPI_PATH, &handle);
+	if (ACPI_FAILURE(status))
+		return -ENODEV;
+
+	params[0].type          = ACPI_TYPE_INTEGER;
+	params[0].integer.value = 0;			/* instance */
+	params[1].type          = ACPI_TYPE_INTEGER;
+	params[1].integer.value = method_id;
+	params[2].type             = ACPI_TYPE_BUFFER;
+	params[2].buffer.length    = in_len;
+	params[2].buffer.pointer   = (u8 *)in_buf;
+
+	input.count   = 3;
+	input.pointer = params;
+
+	status = acpi_evaluate_object(handle, NULL, &input, out ? &result : NULL);
 	if (ACPI_FAILURE(status))
 		return -EIO;
 
 	if (out)
 		*out = result.pointer;
 	else
-		kfree(result.pointer);
+		kfree(result.pointer);	/* NULL when out==NULL; kfree(NULL) is safe */
 
 	return 0;
 }
@@ -134,8 +157,8 @@ static int legion_get_fan_curve(struct legion_wmi_fan *lf)
 	u8 *buf;
 	int ret, i;
 
-	ret = legion_wmi_evaluate(FAN_METHOD_GET_CURVE,
-				  in, sizeof(in), &obj);
+	ret = legion_wmab_evaluate(FAN_METHOD_GET_CURVE,
+				   in, sizeof(in), &obj);
 	if (ret)
 		return ret;
 	if (!obj)
@@ -211,8 +234,8 @@ static int legion_set_fan_curve(struct legion_wmi_fan *lf)
 	for (i = 0; i < FAN_CURVE_POINTS; i++)
 		put_unaligned_le16(legion_fixed_temps[i], buf + 31 + i * sizeof(u16));
 
-	return legion_wmi_evaluate(FAN_METHOD_SET_CURVE,
-				   buf, sizeof(buf), NULL);
+	return legion_wmab_evaluate(FAN_METHOD_SET_CURVE,
+				    buf, sizeof(buf), NULL);
 }
 
 /* -------------------------------------------------------------------------
