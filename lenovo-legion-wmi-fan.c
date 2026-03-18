@@ -2,17 +2,25 @@
 /*
  * lenovo-legion-wmi-fan.c - Fan curve control for Lenovo Legion Go series
  *
- * Uses the GameZone WMI GUID (887B54E3-DDDC-4B2C-8B88-68A26A8835D0) via the
- * global wmi_evaluate_method() API.  This avoids binding to the WMI device
- * instance (which is already bound to lenovo_wmi_gamezone) and registers as
- * a platform driver instead.
+ * Uses the GameZone WMI GUID (887B54E3-DDDC-4B2C-8B88-68A26A8835D0) for
+ * detecting hardware support via wmi_has_guid().  Fan curve WMAB methods
+ * (0x05/0x06) are called directly via acpi_evaluate_object() on the ACPI
+ * path \_SB.GZFD.WMAB, because wmi_evaluate_method() wraps the firmware's
+ * buffer response as ACPI_TYPE_INTEGER, losing the actual buffer data.
  *
  * The mainline lenovo_wmi_gamezone driver uses method IDs 43/44/45 for
- * platform_profile switching.  This driver uses IDs 5/6/16/18/35/36 — a
- * completely disjoint set — so there is no conflict.
+ * platform_profile switching.  This driver uses WMAB method IDs 5/6 and
+ * WMAE method 0x12 — a completely disjoint set — so there is no conflict.
+ *
+ * Full-speed mode is toggled via the WMAE ACPI method at \_SB.GZFD.WMAE
+ * (method 0x12, feature_id 0x04020000) which is a separate method from WMAB.
+ *
+ * Temperature set-points are fixed by firmware at 10,20,...,100 °C and cannot
+ * be changed.  Fan RPM cannot be read on this hardware; only the curve
+ * percentage values are accessible.
  *
  * Exposes:
- *   hwmon  – fan1_input, pwm1_enable, pwm1_auto_point{1-10}_{pwm,temp}
+ *   hwmon  – pwm1_enable, pwm1_auto_point{1-10}_{pwm,temp}
  *   sysfs  – fan_fullspeed
  *
  * Copyright (C) 2026 honjow
@@ -37,24 +45,17 @@
 
 #define LENOVO_GAMEZONE_GUID	"887B54E3-DDDC-4B2C-8B88-68A26A8835D0"
 
-/* WMI method IDs (decimal == what the ACPI table uses) */
-#define FAN_METHOD_GET_CURVE		0x05	/* GetFanTableData   */
-#define FAN_METHOD_SET_CURVE		0x06	/* SetFanTableData   */
-#define FAN_METHOD_GET_SPEED		0x10	/* GetCurrentFanSpeed */
-#define FAN_METHOD_SET_FEATURE		0x12	/* SetFeatureStatus  */
-#define FAN_METHOD_GET_COUNT		0x23	/* GetFanCount       */
-#define FAN_METHOD_GET_MAX_SPEED	0x24	/* GetFanMaxSpeed    */
+/* WMI method IDs for WMAB (via GameZone GUID) */
+#define FAN_METHOD_GET_CURVE		0x05	/* GetFanTableData  */
+#define FAN_METHOD_SET_CURVE		0x06	/* SetFanTableData  */
+
+/* ACPI paths for WMAB (fan curve) and WMAE (full-speed feature) */
+#define WMAB_ACPI_PATH		"\\_SB.GZFD.WMAB"
+#define WMAE_ACPI_PATH		"\\_SB.GZFD.WMAE"
+#define WMAE_METHOD_SET_FEATURE	0x12
+#define FULLSPEED_FEATURE_ID	0x04020000U	/* SetFeatureStatus id */
 
 #define FAN_CURVE_POINTS	10	/* fixed by firmware protocol */
-#define FAN_DEFAULT_FAN_ID	0
-#define FAN_DEFAULT_SENSOR_ID	0
-
-/* GetFanTableData response buffer offsets */
-#define FAN_BUF_FAN_ID_OFF	0	/* u16 LE */
-#define FAN_BUF_SENSOR_ID_OFF	2	/* u16 LE */
-#define FAN_BUF_SPEED_CNT_OFF	4	/* u32 LE: number of speed entries */
-#define FAN_BUF_SPEED_DATA_OFF	8	/* u16 LE * speed_count */
-/* temp_count u32 LE follows immediately after speed data */
 
 /* pwm1_enable values (standard hwmon convention) */
 #define PWM_ENABLE_FULLSPEED	0
@@ -66,8 +67,12 @@
  * ------------------------------------------------------------------------- */
 
 struct legion_fan_curve {
-	u16 temps[FAN_CURVE_POINTS];	/* °C */
 	u16 speeds[FAN_CURVE_POINTS];	/* 0–100 % */
+};
+
+/* Fixed temperature set-points imposed by firmware (°C) */
+static const u16 legion_fixed_temps[FAN_CURVE_POINTS] = {
+	10, 20, 30, 40, 50, 60, 70, 80, 90, 100
 };
 
 struct legion_wmi_fan {
@@ -78,72 +83,58 @@ struct legion_wmi_fan {
 };
 
 /* -------------------------------------------------------------------------
- * Standalone WMI evaluate helpers (uses global GUID-based API)
+ * WMAB ACPI evaluate helper (direct acpi_evaluate_object path)
+ *
+ * wmi_evaluate_method() wraps the firmware's buffer response as
+ * ACPI_TYPE_INTEGER for WMAB, losing the actual buffer data.  Calling
+ * \_SB.GZFD.WMAB directly via acpi_evaluate_object() returns the correct
+ * ACPI_TYPE_BUFFER response.
  * ------------------------------------------------------------------------- */
 
 /**
- * legion_wmi_evaluate() - call a WMI method and optionally return the object
- * @method_id:	method identifier passed to the firmware
- * @in_buf:	pointer to input buffer (may be NULL if in_len == 0)
+ * legion_wmab_evaluate() - call WMAB directly via acpi_evaluate_object()
+ * @method_id:	method identifier passed as the second integer argument
+ * @in_buf:	pointer to input buffer
  * @in_len:	length of input buffer in bytes
  * @out:	if non-NULL, receives the allocated acpi_object (caller frees);
- *		if NULL the result is freed here
+ *		if NULL the result is discarded
  *
  * Returns 0 on success, negative errno on failure.
  */
-static int legion_wmi_evaluate(u8 method_id,
-			       const void *in_buf, size_t in_len,
-			       union acpi_object **out)
+static int legion_wmab_evaluate(u8 method_id,
+				const void *in_buf, size_t in_len,
+				union acpi_object **out)
 {
-	struct acpi_buffer input  = { (acpi_size)in_len, (void *)in_buf };
+	struct acpi_object_list input;
+	union acpi_object params[3];
 	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	acpi_handle handle;
 	acpi_status status;
 
-	status = wmi_evaluate_method(LENOVO_GAMEZONE_GUID, 0, method_id,
-				     &input, &result);
+	status = acpi_get_handle(NULL, WMAB_ACPI_PATH, &handle);
+	if (ACPI_FAILURE(status))
+		return -ENODEV;
+
+	params[0].type          = ACPI_TYPE_INTEGER;
+	params[0].integer.value = 0;			/* instance */
+	params[1].type          = ACPI_TYPE_INTEGER;
+	params[1].integer.value = method_id;
+	params[2].type             = ACPI_TYPE_BUFFER;
+	params[2].buffer.length    = in_len;
+	params[2].buffer.pointer   = (u8 *)in_buf;
+
+	input.count   = 3;
+	input.pointer = params;
+
+	status = acpi_evaluate_object(handle, NULL, &input, out ? &result : NULL);
 	if (ACPI_FAILURE(status))
 		return -EIO;
 
 	if (out)
 		*out = result.pointer;
 	else
-		kfree(result.pointer);
+		kfree(result.pointer);	/* NULL when out==NULL; kfree(NULL) is safe */
 
-	return 0;
-}
-
-/**
- * legion_wmi_evaluate_int() - call a WMI method and return an integer result
- *
- * Handles both ACPI_TYPE_INTEGER and short ACPI_TYPE_BUFFER responses
- * (some firmware versions return a 4-byte buffer instead of an integer).
- */
-static int legion_wmi_evaluate_int(u8 method_id,
-				   const void *in_buf, size_t in_len,
-				   u64 *out_val)
-{
-	union acpi_object *obj = NULL;
-	int ret;
-
-	ret = legion_wmi_evaluate(method_id, in_buf, in_len, &obj);
-	if (ret)
-		return ret;
-	if (!obj)
-		return -ENODATA;
-
-	if (obj->type == ACPI_TYPE_INTEGER) {
-		if (out_val)
-			*out_val = obj->integer.value;
-	} else if (obj->type == ACPI_TYPE_BUFFER &&
-		   obj->buffer.length >= sizeof(u32)) {
-		if (out_val)
-			*out_val = get_unaligned_le32(obj->buffer.pointer);
-	} else {
-		kfree(obj);
-		return -ENXIO;
-	}
-
-	kfree(obj);
 	return 0;
 }
 
@@ -153,15 +144,21 @@ static int legion_wmi_evaluate_int(u8 method_id,
 
 static int legion_get_fan_curve(struct legion_wmi_fan *lf)
 {
-	u8 in[4] = { FAN_DEFAULT_FAN_ID, 0, FAN_DEFAULT_SENSOR_ID, 0 };
+	/*
+	 * GetFanTableData (method 0x05) response format (44 bytes):
+	 *   [0-3]   count = 10 (u32 LE)
+	 *   [4-43]  speeds[0..9] (u32 LE each, value 0-100 %)
+	 *
+	 * Input: 4 zero bytes.  No fan_id/sensor_id header in either direction.
+	 */
+	u8 in[4] = { 0 };
 	union acpi_object *obj = NULL;
-	size_t temp_cnt_off, expected;
-	u32 speed_cnt, temp_cnt, cnt;
+	u32 count;
 	u8 *buf;
 	int ret, i;
 
-	ret = legion_wmi_evaluate(FAN_METHOD_GET_CURVE,
-				  in, sizeof(in), &obj);
+	ret = legion_wmab_evaluate(FAN_METHOD_GET_CURVE,
+				   in, sizeof(in), &obj);
 	if (ret)
 		return ret;
 	if (!obj)
@@ -174,48 +171,30 @@ static int legion_get_fan_curve(struct legion_wmi_fan *lf)
 
 	buf = obj->buffer.pointer;
 
-	/* Need at least header (8 bytes) + one speed (2 bytes) */
-	if (obj->buffer.length < FAN_BUF_SPEED_DATA_OFF + sizeof(u16)) {
+	/* Need at least the count field (4 bytes) + one speed entry (4 bytes) */
+	if (obj->buffer.length < sizeof(u32) + sizeof(u32)) {
 		ret = -ENODATA;
 		goto out;
 	}
 
-	speed_cnt = get_unaligned_le32(buf + FAN_BUF_SPEED_CNT_OFF);
-	if (speed_cnt == 0 || speed_cnt > FAN_CURVE_POINTS) {
+	count = get_unaligned_le32(buf);
+	if (count == 0 || count > FAN_CURVE_POINTS) {
 		ret = -ERANGE;
 		goto out;
 	}
 
-	temp_cnt_off = FAN_BUF_SPEED_DATA_OFF + speed_cnt * sizeof(u16);
-	expected = temp_cnt_off + sizeof(u32);
-	if (obj->buffer.length < expected) {
+	/* Validate buffer contains all speed data */
+	if (obj->buffer.length < sizeof(u32) + count * sizeof(u32)) {
 		ret = -ENODATA;
 		goto out;
 	}
 
-	temp_cnt = get_unaligned_le32(buf + temp_cnt_off);
-	if (temp_cnt == 0 || temp_cnt > FAN_CURVE_POINTS) {
-		ret = -ERANGE;
-		goto out;
-	}
-
-	expected = temp_cnt_off + sizeof(u32) + temp_cnt * sizeof(u16);
-	if (obj->buffer.length < expected) {
-		ret = -ENODATA;
-		goto out;
-	}
-
-	cnt = min(speed_cnt, temp_cnt);
-	for (i = 0; i < (int)cnt; i++) {
-		lf->curve.speeds[i] = get_unaligned_le16(
-			buf + FAN_BUF_SPEED_DATA_OFF + i * sizeof(u16));
-		lf->curve.temps[i]  = get_unaligned_le16(
-			buf + temp_cnt_off + sizeof(u32) + i * sizeof(u16));
-	}
-	/* Pad remaining points with the last valid value */
-	for (i = cnt; i < FAN_CURVE_POINTS; i++) {
-		lf->curve.speeds[i] = lf->curve.speeds[cnt - 1];
-		lf->curve.temps[i]  = lf->curve.temps[cnt - 1];
+	for (i = 0; i < FAN_CURVE_POINTS; i++) {
+		if (i < (int)count)
+			lf->curve.speeds[i] = (u16)get_unaligned_le32(
+				buf + sizeof(u32) + i * sizeof(u32));
+		else
+			lf->curve.speeds[i] = lf->curve.speeds[count - 1];
 	}
 out:
 	kfree(obj);
@@ -225,77 +204,99 @@ out:
 static int legion_set_fan_curve(struct legion_wmi_fan *lf)
 {
 	/*
-	 * Buffer layout (48 bytes total):
-	 *   fan_id   (2 bytes LE)
-	 *   sensor_id (2 bytes LE)
-	 *   speed_count (4 bytes LE)
-	 *   speeds[10]  (10 × 2 bytes LE)
-	 *   temp_count  (4 bytes LE)
-	 *   temps[10]   (10 × 2 bytes LE)
+	 * SetFanTableData (method 0x06) input buffer (52 bytes total).
+	 * Layout matches the hhd firmware protocol exactly:
+	 *
+	 *   Offset  Size  Content
+	 *   0       2     0x00 0x00  header/padding
+	 *   2       4     speed_count = 10 (u32 LE)
+	 *   6       20    speeds[0..9] as u16 LE (2 bytes each)
+	 *   26      1     0x00       padding
+	 *   27      4     temp_count = 10 (u32 LE)
+	 *   31      20    fixed temps 10..100 °C as u16 LE (2 bytes each)
+	 *   51      1     0x00       trailing byte
+	 *   Total: 52 bytes
 	 */
-	u8 buf[4 + 4 + FAN_CURVE_POINTS * 2 + 4 + FAN_CURVE_POINTS * 2];
-	u8 *p = buf;
+	u8 buf[52] = { 0 };
 	int i;
 
-	put_unaligned_le16(FAN_DEFAULT_FAN_ID,    p); p += sizeof(u16);
-	put_unaligned_le16(FAN_DEFAULT_SENSOR_ID, p); p += sizeof(u16);
-	put_unaligned_le32(FAN_CURVE_POINTS, p);       p += sizeof(u32);
-	for (i = 0; i < FAN_CURVE_POINTS; i++) {
-		put_unaligned_le16(lf->curve.speeds[i], p);
-		p += sizeof(u16);
-	}
-	put_unaligned_le32(FAN_CURVE_POINTS, p);       p += sizeof(u32);
-	for (i = 0; i < FAN_CURVE_POINTS; i++) {
-		put_unaligned_le16(lf->curve.temps[i], p);
-		p += sizeof(u16);
-	}
+	/* speed_count at offset 2 */
+	put_unaligned_le32(FAN_CURVE_POINTS, buf + 2);
 
-	return legion_wmi_evaluate(FAN_METHOD_SET_CURVE,
-				   buf, sizeof(buf), NULL);
+	/* speeds[0..9] at offset 6, each u16 LE */
+	for (i = 0; i < FAN_CURVE_POINTS; i++)
+		put_unaligned_le16(lf->curve.speeds[i], buf + 6 + i * sizeof(u16));
+
+	/* temp_count at offset 27 */
+	put_unaligned_le32(FAN_CURVE_POINTS, buf + 27);
+
+	/* fixed temperatures at offset 31, each u16 LE */
+	for (i = 0; i < FAN_CURVE_POINTS; i++)
+		put_unaligned_le16(legion_fixed_temps[i], buf + 31 + i * sizeof(u16));
+
+	return legion_wmab_evaluate(FAN_METHOD_SET_CURVE,
+				    buf, sizeof(buf), NULL);
 }
 
 /* -------------------------------------------------------------------------
- * Full-speed mode
+ * Full-speed mode via WMAE (\_SB.GZFD.WMAE method 0x12)
  *
- * From ACPI reverse engineering (corando98/LLG_Dev_scripts):
- *   enable:  WMAE 0 0x12 0x0104020100  → bytes [01 04 02 01 00]
- *   disable: WMAE 0 0x12 0x0004020000  → bytes [00 04 02 00 00]
+ * From the hhd reference implementation (confirmed working on hardware):
+ *   set_feature(0x04020000, 1)  → full speed on
+ *   set_feature(0x04020000, 0)  → full speed off
+ *
+ * Input to WMAE method 0x12: 8 bytes = feature_id(u32 LE) + value(u32 LE)
+ *
+ * WMAE is a different ACPI method from WMAB (which handles the fan curve).
+ * We call it directly via acpi_evaluate_object() to avoid needing its WMI
+ * GUID, since the path \_SB.GZFD.WMAE is stable across firmware versions.
  * ------------------------------------------------------------------------- */
+
+static int legion_wmae_set_feature(u32 feature_id, u32 value)
+{
+	struct acpi_object_list input;
+	union acpi_object params[3];
+	acpi_handle handle;
+	acpi_status status;
+	u8 buf[8];
+
+	status = acpi_get_handle(NULL, WMAE_ACPI_PATH, &handle);
+	if (ACPI_FAILURE(status))
+		return -ENODEV;
+
+	put_unaligned_le32(feature_id, buf);
+	put_unaligned_le32(value,      buf + sizeof(u32));
+
+	params[0].type          = ACPI_TYPE_INTEGER;
+	params[0].integer.value = 0;			/* instance */
+	params[1].type          = ACPI_TYPE_INTEGER;
+	params[1].integer.value = WMAE_METHOD_SET_FEATURE;
+	params[2].type             = ACPI_TYPE_BUFFER;
+	params[2].buffer.length    = sizeof(buf);
+	params[2].buffer.pointer   = buf;
+
+	input.count   = 3;
+	input.pointer = params;
+
+	status = acpi_evaluate_object(handle, NULL, &input, NULL);
+	return ACPI_FAILURE(status) ? -EIO : 0;
+}
 
 static int legion_set_fullspeed(struct legion_wmi_fan *lf, bool enable)
 {
-	u8 buf[5];
-
-	buf[0] = enable ? 0x01 : 0x00;
-	buf[1] = 0x04;
-	buf[2] = 0x02;
-	buf[3] = enable ? 0x01 : 0x00;
-	buf[4] = 0x00;
-
-	return legion_wmi_evaluate(FAN_METHOD_SET_FEATURE,
-				   buf, sizeof(buf), NULL);
+	return legion_wmae_set_feature(FULLSPEED_FEATURE_ID, enable ? 1 : 0);
 }
 
 /* -------------------------------------------------------------------------
- * hwmon ops (fan1_input and pwm1_enable)
+ * hwmon ops (pwm1_enable)
  * ------------------------------------------------------------------------- */
 
 static umode_t legion_hwmon_is_visible(const void *data,
 				       enum hwmon_sensor_types type,
 				       u32 attr, int channel)
 {
-	switch (type) {
-	case hwmon_fan:
-		if (attr == hwmon_fan_input)
-			return 0444;
-		break;
-	case hwmon_pwm:
-		if (attr == hwmon_pwm_enable)
-			return 0644;
-		break;
-	default:
-		break;
-	}
+	if (type == hwmon_pwm && attr == hwmon_pwm_enable)
+		return 0644;
 	return 0;
 }
 
@@ -303,34 +304,14 @@ static int legion_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			     u32 attr, int channel, long *val)
 {
 	struct legion_wmi_fan *lf = dev_get_drvdata(dev);
-	u8 in[4] = { FAN_DEFAULT_FAN_ID, 0, 0, 0 };
-	u64 speed;
-	int ret;
 
-	switch (type) {
-	case hwmon_fan:
-		if (attr != hwmon_fan_input)
-			return -EOPNOTSUPP;
-		mutex_lock(&lf->lock);
-		ret = legion_wmi_evaluate_int(FAN_METHOD_GET_SPEED,
-					      in, sizeof(in), &speed);
-		mutex_unlock(&lf->lock);
-		if (ret)
-			return ret;
-		*val = (long)speed;
-		return 0;
-
-	case hwmon_pwm:
-		if (attr != hwmon_pwm_enable)
-			return -EOPNOTSUPP;
-		mutex_lock(&lf->lock);
-		*val = lf->pwm_enable;
-		mutex_unlock(&lf->lock);
-		return 0;
-
-	default:
+	if (type != hwmon_pwm || attr != hwmon_pwm_enable)
 		return -EOPNOTSUPP;
-	}
+
+	mutex_lock(&lf->lock);
+	*val = lf->pwm_enable;
+	mutex_unlock(&lf->lock);
+	return 0;
 }
 
 static int legion_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
@@ -370,7 +351,6 @@ static int legion_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 }
 
 static const struct hwmon_channel_info * const legion_hwmon_info[] = {
-	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT),
 	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE),
 	NULL,
 };
@@ -440,43 +420,11 @@ static ssize_t pwm_auto_point_temp_show(struct device *dev,
 					 struct device_attribute *attr,
 					 char *buf)
 {
-	struct legion_wmi_fan *lf = dev_get_drvdata(dev);
 	struct sensor_device_attribute *sda = to_sensor_dev_attr(attr);
 	int idx = sda->index;
-	long temp_mc;
 
-	mutex_lock(&lf->lock);
-	temp_mc = (long)lf->curve.temps[idx] * 1000;
-	mutex_unlock(&lf->lock);
-
-	return sysfs_emit(buf, "%ld\n", temp_mc);
-}
-
-static ssize_t pwm_auto_point_temp_store(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t count)
-{
-	struct legion_wmi_fan *lf = dev_get_drvdata(dev);
-	struct sensor_device_attribute *sda = to_sensor_dev_attr(attr);
-	int idx = sda->index;
-	long val;
-	int ret;
-
-	ret = kstrtol(buf, 10, &val);
-	if (ret)
-		return ret;
-	/* 0 °C to 120 °C in millidegrees */
-	if (val < 0 || val > 120000)
-		return -EINVAL;
-
-	mutex_lock(&lf->lock);
-	lf->curve.temps[idx] = (u16)(val / 1000);
-	ret = 0;
-	if (lf->pwm_enable == PWM_ENABLE_MANUAL)
-		ret = legion_set_fan_curve(lf);
-	mutex_unlock(&lf->lock);
-
-	return ret ? ret : (ssize_t)count;
+	/* Temperatures are fixed by firmware; no need to lock or access lf */
+	return sysfs_emit(buf, "%ld\n", (long)legion_fixed_temps[idx] * 1000);
 }
 
 /* Expand one auto_point index (1-based for user, 0-based for array) */
@@ -484,9 +432,9 @@ static ssize_t pwm_auto_point_temp_store(struct device *dev,
 static SENSOR_DEVICE_ATTR(pwm1_auto_point##_n##_pwm, 0644,		\
 			  pwm_auto_point_pwm_show,			\
 			  pwm_auto_point_pwm_store, (_n) - 1);		\
-static SENSOR_DEVICE_ATTR(pwm1_auto_point##_n##_temp, 0644,		\
+static SENSOR_DEVICE_ATTR(pwm1_auto_point##_n##_temp, 0444,		\
 			  pwm_auto_point_temp_show,			\
-			  pwm_auto_point_temp_store, (_n) - 1)
+			  NULL, (_n) - 1)
 
 LEGION_AUTO_POINT(1);
 LEGION_AUTO_POINT(2);
@@ -623,8 +571,6 @@ static int legion_wmi_fan_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct legion_wmi_fan *lf;
-	u8 in[4] = { 0 };
-	u64 fan_count = 0;
 	int ret;
 
 	lf = devm_kzalloc(dev, sizeof(*lf), GFP_KERNEL);
@@ -635,24 +581,17 @@ static int legion_wmi_fan_probe(struct platform_device *pdev)
 	mutex_init(&lf->lock);
 	dev_set_drvdata(dev, lf);
 
-	/* Verify the firmware supports fan control */
-	ret = legion_wmi_evaluate_int(FAN_METHOD_GET_COUNT,
-				      in, sizeof(in), &fan_count);
+	/*
+	 * Validate firmware support by reading the current fan curve.
+	 * GetFanCount (0x23) always returns 0 on Legion Go hardware, so we
+	 * use GetFanTableData (0x05) as the probe check instead.
+	 */
+	ret = legion_get_fan_curve(lf);
 	if (ret) {
-		dev_warn(dev, "Failed to get fan count (%d)\n", ret);
+		dev_warn(dev, "Failed to read fan curve from firmware (%d)\n",
+			 ret);
 		return ret;
 	}
-	if (fan_count == 0) {
-		dev_warn(dev, "Firmware reports zero fans\n");
-		return -ENODEV;
-	}
-	dev_info(dev, "Fan count: %llu\n", fan_count);
-
-	/* Snapshot the current fan curve from firmware */
-	ret = legion_get_fan_curve(lf);
-	if (ret)
-		dev_warn(dev, "Could not read initial fan curve (%d); using defaults\n",
-			 ret);
 
 	/* Register the hwmon device */
 	lf->hwmon_dev = devm_hwmon_device_register_with_info(
@@ -671,8 +610,7 @@ static int legion_wmi_fan_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	dev_info(dev, "Lenovo Legion Go WMI fan driver loaded (%llu fan(s))\n",
-		 fan_count);
+	dev_info(dev, "Lenovo Legion Go WMI fan driver loaded\n");
 	return 0;
 }
 

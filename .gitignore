@@ -12,3 +12,4 @@ modules.builtin.modinfo
 Module.symvers
 modules.order
 .module-common.o
+.*.cmd
