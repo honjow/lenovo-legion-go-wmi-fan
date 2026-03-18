@@ -30,15 +30,15 @@ This driver fills that gap without touching or conflicting with any mainline cod
 
 ## How it coexists with mainline drivers
 
-This driver is implemented as a **platform driver** that calls the WMI firmware
-methods directly via `wmi_evaluate_method()` (the global GUID-based API).  It
+This driver is implemented as a **platform driver** that calls the ACPI firmware
+methods directly via `acpi_evaluate_object()`.  It
 does **not** bind to the WMI device instance, which means it coexists safely
 with `lenovo_wmi_gamezone` even though both reference the same GameZone GUID.
 
 On Legion Go hardware, the GameZone GUID has a single device instance that
-`lenovo_wmi_gamezone` binds to for `platform_profile` support.  A second
-`wmi_driver` would never get probed because there is no second instance.
-Using the GUID-based call API sidesteps that limitation entirely.
+`lenovo_wmi_gamezone` binds to for `platform_profile` support.  This driver
+calls the ACPI methods (`\_SB.GZFD.WMAB` and `\_SB.GZFD.WMAE`) directly
+via `acpi_evaluate_object()`, bypassing the WMI subsystem entirely.
 
 Each driver uses completely different method IDs and neither interferes with
 the other.
@@ -202,4 +202,4 @@ dmesg | tail -20
 
 ## License
 
-GPL-2.0 — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE)
