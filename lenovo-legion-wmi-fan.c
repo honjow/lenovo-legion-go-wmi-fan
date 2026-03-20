@@ -563,6 +563,8 @@ static const struct dmi_system_id legion_go_dmi_table[] = {
 	{ }
 };
 
+MODULE_DEVICE_TABLE(dmi, legion_go_dmi_table);
+
 /* -------------------------------------------------------------------------
  * Platform driver probe / remove
  * ------------------------------------------------------------------------- */
